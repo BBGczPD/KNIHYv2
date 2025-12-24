@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import json
 import shutil
 import zipfile
 import tempfile
@@ -1130,6 +1131,29 @@ def _fetch_databazeknih_detail(detail_url: str) -> Dict[str, str]:
                     if next_span:
                         isbn = next_span.get_text(" ", strip=True)
                         break
+        if not isbn:
+            for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+                raw = script.string or script.get_text(strip=True)
+                if not raw:
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict) and payload.get("isbn"):
+                    isbn = str(payload["isbn"])
+                    break
+                if isinstance(payload, list):
+                    for item in payload:
+                        if isinstance(item, dict) and item.get("isbn"):
+                            isbn = str(item["isbn"])
+                            break
+                if isbn:
+                    break
+        if not isbn:
+            match = re.search(r"\\bisbn\\s*[:=]\\s*['\\\"]?([0-9\\-\\s]{10,17})", text_full, flags=re.IGNORECASE)
+            if match:
+                isbn = match.group(1)
         isbn_nodes.extend(soup.find_all(attrs={"itemprop": re.compile("isbn", re.IGNORECASE)}))
         isbn_nodes.extend(soup.find_all("meta", attrs={"property": re.compile("isbn", re.IGNORECASE)}))
         for label in soup.find_all(["dt", "th"], string=re.compile("ISBN", re.IGNORECASE)):
