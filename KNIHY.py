@@ -1122,13 +1122,21 @@ def _fetch_databazeknih_detail(detail_url: str) -> Dict[str, str]:
 
         isbn = ""
         isbn_nodes = []
+        more_info = soup.find(id="more_book_info")
+        if more_info:
+            for label in more_info.find_all("span", class_=re.compile("category")):
+                if "isbn" in label.get_text(" ", strip=True).lower():
+                    next_span = label.find_next("span")
+                    if next_span:
+                        isbn = next_span.get_text(" ", strip=True)
+                        break
         isbn_nodes.extend(soup.find_all(attrs={"itemprop": re.compile("isbn", re.IGNORECASE)}))
         isbn_nodes.extend(soup.find_all("meta", attrs={"property": re.compile("isbn", re.IGNORECASE)}))
         for label in soup.find_all(["dt", "th"], string=re.compile("ISBN", re.IGNORECASE)):
             sib = label.find_next_sibling(["dd", "td"])
             if sib:
                 isbn_nodes.append(sib)
-        if not isbn_nodes:
+        if not isbn_nodes and not isbn:
             isbn_match = re.search(r"ISBN(?:\s*13)?[:\s]+([0-9\-\s]{10,17})", text_full, flags=re.IGNORECASE)
             isbn = isbn_match.group(1) if isbn_match else ""
         else:
@@ -1599,11 +1607,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def _choose_databazeknih_candidate_safe(self, candidates: list[dict[str, str]]) -> dict[str, str] | None:
         return self._run_on_main_thread(lambda: self._choose_databazeknih_candidate(candidates))
 
-    def _show_metadata_proposal_dialog(self, original: dict[str, str], proposed: dict[str, str]) -> bool:
+    def _show_metadata_proposal_dialog(self, original: dict[str, str], proposed: dict[str, str]) -> dict[str, str] | None:
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("Návrh metadat")
         layout = QtWidgets.QVBoxLayout(dialog)
-        grid = QtWidgets.QFormLayout()
+        columns = QtWidgets.QHBoxLayout()
+        left = QtWidgets.QFormLayout()
+        right = QtWidgets.QFormLayout()
+        columns.addLayout(left, 1)
+        columns.addLayout(right, 1)
         fields = [
             ("Název", "title"),
             ("Autoři", "authors"),
@@ -1613,19 +1625,26 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Štítky", "tags"),
             ("ISBN", "isbn"),
         ]
+        editors: dict[str, QtWidgets.QLineEdit] = {}
         for label, key in fields:
             curr = original.get(key, "")
             prop = proposed.get(key, "")
-            text = f"Návrh: {prop or '—'}"
-            if curr and curr != prop:
-                text = f"{text}\nPůvodně: {curr}"
-            grid.addRow(label, QtWidgets.QLabel(text))
-        layout.addLayout(grid)
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+            left_text = curr or "—"
+            left.addRow(label, QtWidgets.QLabel(left_text))
+            editor = QtWidgets.QLineEdit(prop)
+            editors[key] = editor
+            right.addRow(label, editor)
+        layout.addLayout(columns)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
         layout.addWidget(buttons)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
-        return dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return None
+        edited = {key: editor.text() for key, editor in editors.items()}
+        return _clean_metadata_fields(edited)
 
     def _run_on_main_thread(self, fn) -> object:
         if threading.current_thread() is threading.main_thread():
@@ -1706,10 +1725,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not merged:
                     self._log("Nic k doplnění, zůstal původní obsah.")
                     return
-                approved = bool(self._run_on_main_thread(lambda: self._show_metadata_proposal_dialog(base_md, merged)))
-                if not approved:
+                updated = self._run_on_main_thread(lambda: self._show_metadata_proposal_dialog(base_md, merged))
+                if not updated:
                     self._log("Návrh metadat byl odmítnut.")
                     return
+                merged = _clean_metadata_fields(updated)
                 self.signals.metadata_ready.emit(merged)
                 saved = write_metadata(path, merged)
                 if saved:
