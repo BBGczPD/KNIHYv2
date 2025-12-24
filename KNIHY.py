@@ -1639,7 +1639,7 @@ class MainWindow(QtWidgets.QMainWindow):
             finally:
                 done.set()
 
-        QtCore.QTimer.singleShot(0, wrapper)
+        QtCore.QTimer.singleShot(0, self, wrapper)
         if not done.wait(timeout=60):
             self._log("VAROVANI: Čekání na UI dialog vypršelo.")
         return result.get("value")
