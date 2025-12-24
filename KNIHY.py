@@ -1074,6 +1074,7 @@ def _fetch_databazeknih_detail(detail_url: str) -> Dict[str, str]:
         if title_node:
             title_candidates.append(_clean_dbk_title(title_node.get_text(" ", strip=True)))
         title = next((t for t in title_candidates if t), "")
+        text_full = soup.get_text(" ", strip=True)
         author = ""
         author_links = soup.find_all("a", href=re.compile(r"/(autor|autori)/"))
         if author_links:
@@ -1083,7 +1084,6 @@ def _fetch_databazeknih_detail(detail_url: str) -> Dict[str, str]:
             match = re.search(r"Autor(?:\:)?\s*([A-ZŽŠČŘÉÚŮÓÁ][^\n\r,]{2,100})", text_full)
             if match:
                 author = match.group(1).strip()
-        text_full = soup.get_text(" ", strip=True)
         series = ""
         series_index = ""
         series_block = soup.find(class_=re.compile("orangeBoxSmall"))
@@ -1218,6 +1218,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1250, 820)
         self.setAcceptDrops(True)
         self._dbk_dialog_open = False
+        self._metadata_busy = False
         self._files: list[Path] = []
         self._current_path: Path | None = None
         self.signals = UiSignals()
@@ -1596,7 +1597,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._dbk_dialog_open = False
 
     def _choose_databazeknih_candidate_safe(self, candidates: list[dict[str, str]]) -> dict[str, str] | None:
-        return self._choose_databazeknih_candidate(candidates)
+        return self._run_on_main_thread(lambda: self._choose_databazeknih_candidate(candidates))
 
     def _show_metadata_proposal_dialog(self, original: dict[str, str], proposed: dict[str, str]) -> bool:
         dialog = QtWidgets.QDialog(self)
@@ -1651,64 +1652,76 @@ class MainWindow(QtWidgets.QMainWindow):
         if not WEBLIBS_AVAILABLE:
             self._log("DatabazeKnih není dostupná (chybí requests/bs4).")
             return
+        if self._metadata_busy:
+            self._log("Vyhledávání metadat již běží.")
+            return
+        self._metadata_busy = True
 
-        self._set_busy(True, "Hledám metadata…")
-        base_md: dict[str, str] = read_metadata(path) if which("ebook-meta") else {}
-        base_md = self._merge_guess(base_md, path)
-        base_md = _clean_metadata_fields(base_md)
-        candidates = self._build_title_candidates(path, base_md)
-        isbn = (base_md.get("isbn") or "").strip()
-        fetched: dict[str, str] = {}
-        if isbn:
-            self._log(f"Hledám ISBN {isbn}…")
-            primary = fetch_from_databazeknih_by_isbn(isbn)
-            fetched = _clean_metadata_fields(primary or {})
-        if not fetched:
-            for title_option in candidates:
-                if not title_option:
-                    continue
-                self._log(f"Hledám název: {title_option}")
-                candidates_md = fetch_databazeknih_candidates_by_title(title_option, limit=5)
-                if candidates_md:
-                    choice_md = self._choose_databazeknih_candidate_safe(candidates_md) or candidates_md[0]
-                    detail_url = choice_md.get("detail_url")
-                    if detail_url:
-                        details = _fetch_databazeknih_detail(detail_url)
-                        if details:
-                            fetched.update(details)
-                    if not fetched:
-                        fetched.update({k: v for k, v in choice_md.items() if k != "detail_url"})
-                if fetched:
-                    break
-        merged = base_md.copy()
-        fetched_clean = _clean_metadata_fields(fetched)
-        for key, val in fetched_clean.items():
-            if val:
-                merged[key] = val
-        merged = _backfill_series_info(merged, fetched_clean)
-        if not merged.get("language"):
-            merged["language"] = "cs"
-        if not merged.get("tags"):
-            merged["tags"] = self.tags_edit.text()
-        if isbn and not merged.get("isbn"):
-            merged["isbn"] = isbn
-        merged = _clean_metadata_fields(merged)
-        if not merged:
-            self._set_busy(False, "")
-            self._log("Nic k doplnění, zůstal původní obsah.")
-            return
-        approved = bool(self._show_metadata_proposal_dialog(base_md, merged))
-        self._set_busy(False, "")
-        if not approved:
-            self._log("Návrh metadat byl odmítnut.")
-            return
-        self._fill_metadata_fields(merged)
-        saved = write_metadata(path, merged)
-        if saved:
-            self._log("Metadata byla uložena po potvrzení.")
-        else:
-            self._log("Zápis metadat se nezdařil (viz _error.txt).")
-        self._rename_by_metadata(merged)
+        def job() -> None:
+            self.signals.busy.emit(True, "Hledám metadata…")
+            try:
+                base_md: dict[str, str] = read_metadata(path) if which("ebook-meta") else {}
+                base_md = self._merge_guess(base_md, path)
+                base_md = _clean_metadata_fields(base_md)
+                candidates = self._build_title_candidates(path, base_md)
+                isbn = (base_md.get("isbn") or "").strip()
+                fetched: dict[str, str] = {}
+                if isbn:
+                    self._log(f"Hledám ISBN {isbn}…")
+                    primary = fetch_from_databazeknih_by_isbn(isbn)
+                    fetched = _clean_metadata_fields(primary or {})
+                if not fetched:
+                    for title_option in candidates:
+                        if not title_option:
+                            continue
+                        self._log(f"Hledám název: {title_option}")
+                        candidates_md = fetch_databazeknih_candidates_by_title(title_option, limit=5)
+                        if candidates_md:
+                            choice_md = self._choose_databazeknih_candidate_safe(candidates_md)
+                            if not choice_md:
+                                self._log("Výběr kandidáta byl zrušen.")
+                                return
+                            detail_url = choice_md.get("detail_url")
+                            if detail_url:
+                                details = _fetch_databazeknih_detail(detail_url)
+                                if details:
+                                    fetched.update(details)
+                            if not fetched:
+                                fetched.update({k: v for k, v in choice_md.items() if k != "detail_url"})
+                        if fetched:
+                            break
+                merged = base_md.copy()
+                fetched_clean = _clean_metadata_fields(fetched)
+                for key, val in fetched_clean.items():
+                    if val:
+                        merged[key] = val
+                merged = _backfill_series_info(merged, fetched_clean)
+                if not merged.get("language"):
+                    merged["language"] = "cs"
+                if not merged.get("tags"):
+                    merged["tags"] = self.tags_edit.text()
+                if isbn and not merged.get("isbn"):
+                    merged["isbn"] = isbn
+                merged = _clean_metadata_fields(merged)
+                if not merged:
+                    self._log("Nic k doplnění, zůstal původní obsah.")
+                    return
+                approved = bool(self._run_on_main_thread(lambda: self._show_metadata_proposal_dialog(base_md, merged)))
+                if not approved:
+                    self._log("Návrh metadat byl odmítnut.")
+                    return
+                self.signals.metadata_ready.emit(merged)
+                saved = write_metadata(path, merged)
+                if saved:
+                    self._log("Metadata byla uložena po potvrzení.")
+                else:
+                    self._log("Zápis metadat se nezdařil (viz _error.txt).")
+                self._run_on_main_thread(lambda: self._rename_by_metadata(merged))
+            finally:
+                self.signals.busy.emit(False, "")
+                self._metadata_busy = False
+
+        threading.Thread(target=job, daemon=True).start()
 
     def _analyze_current_epub(self) -> None:
         path = self._current_path
